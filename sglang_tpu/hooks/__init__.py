@@ -77,6 +77,7 @@ from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduc
 from sglang_tpu.hooks.twolevel_allreduce import (
     merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
 )
+from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +337,7 @@ def register() -> None:
     )
 
     register_muse_spark_processor()
+    register_unified_hicache_strategy()
 
     from sglang.srt.plugins.hook_registry import HookRegistry
 
