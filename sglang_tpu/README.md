@@ -194,7 +194,9 @@ zero launches.
   under Eagle3 or DFlash) in the model dtype, about 94 MiB each for GPT-OSS-120B
   at 16384 rows. They are not reserved before the KV cache is sized, so leave
   that headroom in `--mem-fraction-static`.
-- Not supported with DP attention or prefill context parallelism.
+- Context-parallel stages (PP x PCP) size each receive from their local rows.
+  Multi-device stages need a torch_tpu that starts them. Not supported with
+  DP attention.
 
 ## Fixed-cohort benchmark gate
 
