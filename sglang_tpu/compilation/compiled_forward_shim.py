@@ -193,17 +193,26 @@ def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
     The ICI wave delivers the previous stage's activations at its fixed buffer
     size (the largest token bucket), so a longer proxy is trimmed to this
     stage's padded token count; a shorter one means the two stages padded to
-    different buckets and is rejected.
+    different buckets and is rejected. The buffered hand-off receives exactly
+    the padded token count the scheduler derived from the batch, so any other
+    row count there means that derivation and this padding disagree.
     """
     reference = input_ids if input_ids is not None else forward_batch.input_ids
     if reference is None:
         return proxy
     expected = int(reference.shape[0])
+    exact = envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.get()
     tensors = {}
     trimmed = False
     for name, tensor in proxy.tensors.items():
         if isinstance(tensor, torch.Tensor):
             rows = int(tensor.shape[0])
+            if exact and rows != expected:
+                raise ValueError(
+                    f"pp_proxy_tensors[{name!r}] has {rows} rows but the padded "
+                    f"batch has {expected} input tokens; the buffered hand-off "
+                    "received a different row count than the forward pads to."
+                )
             if rows < expected:
                 raise ValueError(
                     f"pp_proxy_tensors[{name!r}] has {rows} rows but the padded "

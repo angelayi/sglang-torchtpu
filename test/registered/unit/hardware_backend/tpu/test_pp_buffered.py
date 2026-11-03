@@ -3,7 +3,8 @@ in-process transport."""
 
 import threading
 import unittest
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -15,6 +16,23 @@ import torch  # noqa: E402
 from sglang.srt.layers.aux_hidden_states import (  # noqa: E402
     AUX_HIDDEN_STATES_PROXY_KEY,
 )
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
+    ForwardMode,
+    PPProxyTensors,
+)
+from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (  # noqa: E402
+    SpecAuxHiddenStateConfig,
+)
+from sglang_tpu import pp_scheduler  # noqa: E402
+from sglang_tpu.compilation.bucketer import Bucketer  # noqa: E402
+from sglang_tpu.compilation.compiled_forward_shim import (  # noqa: E402
+    _fit_pp_proxy_rows,
+)
+from sglang_tpu.compilation.decoder_compile_policy import (  # noqa: E402
+    DecoderTpuCompilePolicy,
+)
+from sglang_tpu.envs import envs as tpu_envs  # noqa: E402
 from sglang_tpu.pp_buffered import (  # noqa: E402
     _MAX_RECEIVES,
     PPBufferedHandoff,
@@ -419,6 +437,169 @@ class TestPPBufferedHandoffProbe(unittest.TestCase):
             t.join(timeout=10)
         self.assertEqual(verdicts, [True, True, True])
         self.assertTrue(all(handoff.transfers == 1 for handoff in handoffs))
+
+
+class TestReceiveProxy(unittest.TestCase):
+    def test_scheduler_receive_takes_the_batch_padded_rows(self):
+        handoff = make_handoff(1, 2, FakeNet())
+        handoff.receive = Mock(return_value={"hidden_states": torch.zeros(1)})
+        policy = Mock()
+        policy.forward_rows.return_value = 128
+        scheduler = SchedulerPPMixin()
+        scheduler._pp_wave = handoff
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(compile_policy=policy)
+        )
+        handoff.rows_of = lambda batch: pp_scheduler.pp_forward_rows(scheduler, batch)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            reqs=[object(), object()],
+            input_ids=torch.zeros(100, dtype=torch.int64),
+            extend_num_tokens=100,
+            spec_info=None,
+        )
+        proxy = scheduler._pp_recv_proxy(batch)
+        policy.forward_rows.assert_called_once_with(ForwardMode.EXTEND, 100, 2, None)
+        handoff.receive.assert_called_once_with(128)
+        self.assertIn("hidden_states", proxy.tensors)
+
+    def test_first_stage_receives_nothing(self):
+        handoff = make_handoff(0, 2, FakeNet())
+        handoff.begin_iteration(True)
+        self.assertIsNone(handoff.receive_batch(object()))
+
+    def test_decode_rows_follow_the_batch_size(self):
+        policy = Mock()
+        policy.forward_rows.return_value = 8
+        scheduler = SimpleNamespace(
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(compile_policy=policy)
+            ),
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            reqs=[object()] * 5,
+            input_ids=torch.zeros(40, dtype=torch.int64),
+            extend_num_tokens=None,
+            spec_info=None,
+        )
+        self.assertEqual(pp_scheduler.pp_forward_rows(scheduler, batch), 8)
+        policy.forward_rows.assert_called_once_with(ForwardMode.DECODE, 5, 5, None)
+
+
+class TestBufferedHandoffWiring(unittest.TestCase):
+    """SGLANG_USE_TPU_PP_BUFFERED_HANDOFF: what it builds, what it refuses, and the shapes
+    the compiled forward is warmed up and checked with."""
+
+    def _scheduler(self):
+        policy = DecoderTpuCompilePolicy(
+            t_bucketer=Bucketer(name="Token", buckets=[64, 256]),
+            b_bucketer=Bucketer(name="Bs", buckets=[1, 32]),
+        )
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_group = SimpleNamespace(
+            is_first_rank=False, rank_in_group=1, world_size=2, ranks=[0, 1]
+        )
+        scheduler.tp_group = SimpleNamespace()
+        scheduler.world_group = SimpleNamespace()
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                compile_policy=policy,
+                model_config=SimpleNamespace(context_len=4096, hidden_size=16),
+                spec_aux_config=SpecAuxHiddenStateConfig(),
+                pp_group=scheduler.pp_group,
+                model=SimpleNamespace(pp_transfer_dtype=torch.float32),
+                dtype=torch.bfloat16,
+                device="cpu",
+            )
+        )
+        policy.model_runner = scheduler.tp_worker.model_runner
+        return scheduler, policy
+
+    def _no_cross_rank_padding(self):
+        return (
+            patch(
+                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=None),
+        )
+
+    def test_switch_builds_the_buffered_handoff_instead_of_the_wave(self):
+        scheduler, _ = self._scheduler()
+        dp, cp = self._no_cross_rank_padding()
+        with (
+            tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.override(True),
+            dp,
+            cp,
+            patch.object(pp_scheduler, "build_pp_buffered_handoff") as handoff,
+            patch.object(pp_scheduler, "build_pp_wave") as wave,
+        ):
+            scheduler._pp_init_wave()
+        wave.assert_not_called()
+        kwargs = handoff.call_args.kwargs
+        self.assertEqual(kwargs["max_rows"], 256)
+        self.assertEqual(kwargs["dtype"], torch.float32)
+        self.assertEqual(kwargs["aux_dtype"], torch.bfloat16)
+        self.assertEqual(kwargs["depth"], 2)
+        self.assertTrue(callable(kwargs["rows_of"]))
+
+    def test_wave_stays_the_default(self):
+        scheduler, _ = self._scheduler()
+        with (
+            patch.object(pp_scheduler, "build_pp_buffered_handoff") as handoff,
+            patch.object(pp_scheduler, "build_pp_wave") as wave,
+        ):
+            scheduler._pp_init_wave()
+        handoff.assert_not_called()
+        wave.assert_called_once()
+
+    def test_buffered_refuses_dp_attention_and_prefill_cp(self):
+        scheduler, _ = self._scheduler()
+        for dp_on, cp_strategy, needle in (
+            (True, None, "DP attention"),
+            (False, object(), "context parallelism"),
+        ):
+            with (
+                self.subTest(needle=needle),
+                tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.override(True),
+                patch(
+                    "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                    return_value=dp_on,
+                ),
+                patch(
+                    "sglang.srt.layers.cp.base.get_cp_strategy",
+                    return_value=cp_strategy,
+                ),
+                patch.object(pp_scheduler, "build_pp_buffered_handoff") as handoff,
+            ):
+                with self.assertRaisesRegex(NotImplementedError, needle):
+                    scheduler._pp_init_wave()
+                handoff.assert_not_called()
+
+    def test_shim_takes_exactly_the_padded_rows_under_the_buffered_handoff(self):
+        proxy = PPProxyTensors(
+            {"hidden_states": torch.zeros(16, 2), "residual": torch.zeros(16, 2)}
+        )
+        with tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.override(True):
+            with self.assertRaisesRegex(ValueError, "buffered hand-off"):
+                _fit_pp_proxy_rows(proxy, torch.zeros(8), None)
+            self.assertIs(_fit_pp_proxy_rows(proxy, torch.zeros(16), None), proxy)
+        # The wave trims its full-height buffer instead.
+        trimmed = _fit_pp_proxy_rows(proxy, torch.zeros(8), None)
+        self.assertEqual(trimmed.tensors["hidden_states"].shape[0], 8)
+
+    def test_warmup_proxies_are_whole_tensors_under_the_buffered_handoff(self):
+        _, policy = self._scheduler()
+        with tpu_envs.SGLANG_USE_TPU_PP_BUFFERED_HANDOFF.override(True):
+            buffered_proxy = policy._pp_warmup_kwargs(64)["pp_proxy_tensors"]
+        wave_proxy = policy._pp_warmup_kwargs(64)["pp_proxy_tensors"]
+        for name in ("hidden_states", "residual"):
+            self.assertEqual(buffered_proxy[name].shape[0], 64)
+            self.assertIsNone(buffered_proxy[name]._base)
+            self.assertEqual(buffered_proxy[name].dtype, torch.float32)
+            # The wave warms row views of its full-height buffer.
+            self.assertIsNotNone(wave_proxy[name]._base)
 
 
 if __name__ == "__main__":
