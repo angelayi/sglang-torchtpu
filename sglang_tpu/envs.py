@@ -58,6 +58,13 @@ class TpuEnvs:
     # FP8 linear: one W8A8 kernel for decode-sized batches (kernels/fp8_linear_small_m.py);
     # False keeps the XLA path.
     SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL = EnvBool(False)
+    # Pooled DSA indexer (GLM-5.3-Flash), plain decode: widen the top-k rows
+    # (by at most 1/8, whole lanes) so each sparse-MLA gather chunk is a whole
+    # number of SparseCore gather blocks of this many indices, which drops
+    # dsa_gather's pad-and-slice copy of the gathered keys (2176 -> 2304 at 64
+    # requests; vllm-torchtpu #1859 pads to 256 for the same reason). 16384 is
+    # tpu7x's block (2 SparseCores x 16 subcores x 16 lanes x 32 rows); 0 off.
+    SGLANG_TPU_KPOOL_DECODE_WIDTH_GATHER_GRANULE = EnvInt(16384)
     # Sparse MLA: pooled-DSA batches of 512+ tokens (prefill) through the
     # query-blocked kernel (attention/pallas/mla_sparse_qblock.py), which fetches
     # each block's union of selected pages once; False keeps the per-query kernel.
