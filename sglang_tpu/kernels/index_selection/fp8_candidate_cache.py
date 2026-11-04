@@ -146,7 +146,7 @@ def gather_candidate_keys(
     count, per_page = physical.size, PAGE_RECORDS // block
     source_per_page = layout.page_size // block
     per_unit = pl.cdiv(count, units * group) * group
-    scratch_words = buffers * group * PAGE_ROWS * (block + len(banks)) + lanes
+    scratch_words = buffers * group * PAGE_ROWS * (block + len(banks))
     metadata_rows = min(
         per_unit,
         (info.vmem_capacity_bytes // 4 - scratch_words - 4096) // group * group,
@@ -160,7 +160,6 @@ def gather_candidate_keys(
     ids = ids.reshape(-1, units, group).transpose(1, 0, 2).reshape(units, per_unit)
     ids = jnp.pad(ids, ((0, 0), (0, -per_unit % metadata_rows)), constant_values=-1)
     # All output tiles must be written, even when the last requests are empty.
-    control = jnp.full((lanes,), per_unit // group, jnp.int32)
     span, steps = group * PAGE_ROWS, per_unit // group
     mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
 
@@ -170,7 +169,6 @@ def gather_candidate_keys(
         ),
         scratch_types=(
             pltpu.VMEM((metadata_rows,), jnp.int32),
-            pltpu.VMEM((lanes,), jnp.int32),
             pltpu.VMEM((buffers, span, block), jnp.int32),
             pltpu.VMEM((buffers, len(banks), span), jnp.int32),
             pltpu.SemaphoreType.DMA,
@@ -186,10 +184,8 @@ def gather_candidate_keys(
     def gather(
         pool,
         physical_ref,
-        control_ref,
         out,
         selected,
-        control_vmem,
         words,
         read_ids,
         metadata_sem,
@@ -197,8 +193,7 @@ def gather_candidate_keys(
         write_sem,
     ):
         unit = lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
-        pltpu.async_copy(control_ref, control_vmem, metadata_sem).wait()
-        active = control_vmem[...][0]
+        active = jnp.int32(steps)
         metadata = physical_ref.at[unit]
         if metadata_rows < per_unit:
             metadata = metadata.at[:metadata_rows]
@@ -309,4 +304,4 @@ def gather_candidate_keys(
                 lambda last=last: write(active - last - 1, wait=True)
             )
 
-    return gather(banks, ids, control)[: count // per_page * PAGE_ROWS]
+    return gather(banks, ids)[: count // per_page * PAGE_ROWS]

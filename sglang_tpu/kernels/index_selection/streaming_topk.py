@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import functools
 import math
-import random
 from typing import NamedTuple
 
 import jax
@@ -114,12 +113,14 @@ def streaming_topk(
     )
     lengths = jnp.broadcast_to(lengths[:, None], (batch_size, lanes))
     num_blocks = pl.cdiv(width, block_size)
-    order_width = pl.cdiv(num_blocks, hbm_alignment) * hbm_alignment
-    order = list(range(1, num_blocks))
-    random.Random(0).shuffle(order)
-    order.insert(0, 0)
-    order.extend([0] * (order_width - num_blocks))
-    block_order = jnp.asarray(order, jnp.int32)
+    # Compute the non-zero block permutation arithmetically on SparseCore rather
+    # than passing a constant HBM order buffer, which XLA loop hoisting can
+    # place in TensorCore VMEM where SparseCore cannot DMA from it.
+    order_tail = max(1, num_blocks - 1)
+    order_stride = min(32767, max(1, round(order_tail * 0.6180339887498949)))
+    while math.gcd(order_stride, order_tail) != 1:
+        order_stride = 1 if order_stride >= 32767 else order_stride + 1
+    order_offset = (order_tail * 3) // 8
     output_width = pl.cdiv(k, hbm_alignment) * hbm_alignment
     # Retaining a quarter of the bootstrap establishes an exact cutoff without
     # radix-selecting a full large DMA block. This is a tuned scan policy, not
@@ -134,7 +135,7 @@ def streaming_topk(
     id_capacity = capacity
     score_bytes, id_bytes = scores.dtype.itemsize, jnp.dtype(jnp.int32).itemsize
     resident_bytes = score_bytes * (capacity + k) + id_bytes * (id_capacity + k)
-    resident_bytes += id_bytes * (histogram_size + lanes + order_width)
+    resident_bytes += id_bytes * (histogram_size + lanes)
     candidate_bytes = score_bytes * capacity + id_bytes * id_capacity
     # A second candidate bank removes compaction's read/write alias. Keep the
     # ordered in-place path when the caller's capacity exhausts VMEM.
@@ -170,14 +171,13 @@ def streaming_topk(
             pltpu.VMEM((k,), jnp.int32),
             pltpu.VMEM((histogram_size,), jnp.int32),
             pltpu.VMEM((lanes,), jnp.int32),
-            pltpu.VMEM((order_width,), jnp.int32),
             pltpu.SemaphoreType.DMA((buffers,)),
             pltpu.SemaphoreType.DMA,
         ),
         compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
         name="streaming_topk",
     )
-    def kernel(scores_ref, lengths_ref, order_ref, *refs):
+    def kernel(scores_ref, lengths_ref, *refs):
         out_indices_ref, *scratch = refs
         (
             blocks,
@@ -187,14 +187,12 @@ def streaming_topk(
             selected_ids,
             histogram,
             row_length,
-            visit_order,
             block_sems,
             sem,
         ) = scratch
         candidates = candidate_banks.at[pl.ds(0, capacity)]
         candidate_ids = id_banks.at[pl.ds(0, id_capacity)]
         lane_ids = jnp.arange(lanes, dtype=jnp.int32)
-        pltpu.async_copy(order_ref, visit_order, sem).wait()
 
         def store_candidates(count, keys, ids, mask):
             plsc.store_compressed(candidates.at[pl.ds(count, lanes)], keys, mask=mask)
@@ -422,8 +420,15 @@ def streaming_topk(
             )
 
         def lookup(position):
-            indices = jnp.full((lanes,), jnp.minimum(position, num_blocks - 1))
-            return plsc.load_gather(visit_order, [indices])[0]
+            clamped = jnp.minimum(position, jnp.int32(num_blocks - 1))
+            if num_blocks <= 2:
+                return jnp.maximum(clamped, jnp.int32(0))
+            step = jnp.maximum(clamped - jnp.int32(1), jnp.int32(0))
+            shuffled = jnp.int32(1) + jax.lax.rem(
+                step * jnp.int32(order_stride) + jnp.int32(order_offset),
+                jnp.int32(order_tail),
+            )
+            return jnp.where(clamped <= 0, jnp.int32(0), shuffled)
 
         def next_valid(position, length):
             def cond(state):
@@ -715,7 +720,7 @@ def streaming_topk(
                 candidate_ids.at[:output_width], out_indices_ref.at[row], sem
             ).wait()
 
-    result = kernel(scores, lengths, block_order)
+    result = kernel(scores, lengths)
     if output_width != k:
         result = result[:, :k]
     return result
