@@ -26,6 +26,25 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from sglang_tpu.attention.pallas.mla_sparse import kv_cache_utils
 
+# Index rows each SparseCore subcore gathers per block, in `num_lanes` subchunks.
+_NUM_ROW_SUBCHUNKS = 32
+
+
+def gather_block_size() -> int:
+    """Indices per dsa_gather block on this chip (16384 on tpu7x).
+
+    dsa_gather pads its index count up to a multiple of this and slices the
+    output back, so a count that is already a multiple skips that copy.
+    """
+    sc_info = pltpu.get_tpu_info().sparse_core
+    assert sc_info is not None, "SparseCore info is missing."
+    return (
+        sc_info.num_lanes
+        * _NUM_ROW_SUBCHUNKS
+        * sc_info.num_cores
+        * sc_info.num_subcores
+    )
+
 
 def main_kernel(
     nope_in_hbm_ref: Any,
@@ -259,7 +278,7 @@ def dsa_gather(
     # pipeline step to keep multiple gather DMAs in flight.
     # See `outer_pipeline` for details.
     num_streams = 4
-    num_row_subchunks = 32
+    num_row_subchunks = _NUM_ROW_SUBCHUNKS
     assert num_row_subchunks % num_streams == 0, (
         f"{num_streams=} must divide {num_row_subchunks=}."
     )

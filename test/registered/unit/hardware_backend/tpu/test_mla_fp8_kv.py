@@ -382,6 +382,7 @@ class TestSparseIndexerKvLens(CustomTestCase):
         backend = self._backend()
         backend._kpool_width = 2176
         backend._gather_chunk_tokens = 256
+        backend._gather_block = 16384  # tpu7x
         for tokens, decode, width in (
             (64, True, 2304),
             (16, True, 2176),

@@ -238,7 +238,7 @@ def _kpool_row_width(backend, forward_batch, num_tokens: int) -> int:
     whole SparseCore gather blocks for plain decode batches)."""
     width = backend._kpool_width
     mode = getattr(forward_batch, "forward_mode", None)
-    granule = tpu_envs.SGLANG_TPU_KPOOL_DECODE_WIDTH_GATHER_GRANULE.get()
+    granule = getattr(backend, "_gather_block", 0)
     if not granule or mode is None or not mode.is_decode():
         return width
     return gather_aligned_width(
@@ -279,6 +279,12 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         if self._kpool > 1:
             self._kpool_width = topk_row_width(hf_config)
             self._index_topk_op = build_dsa_kpool_topk_op()
+            from sglang_tpu.attention.pallas.mla_sparse.dsa_gather import (
+                gather_block_size,
+            )
+
+            # Read once here, outside the compiled forward (_kpool_row_width).
+            self._gather_block = gather_block_size()
         else:
             self._index_topk_op = build_dsa_index_topk_op()
 
